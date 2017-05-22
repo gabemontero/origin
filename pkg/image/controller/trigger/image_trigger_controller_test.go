@@ -132,6 +132,9 @@ type fakeInstantiator struct {
 }
 
 func (i *fakeInstantiator) Instantiate(namespace string, req *buildapi.BuildRequest) (*buildapi.Build, error) {
+	if i.err != nil {
+		return nil, i.err
+	}
 	i.req, i.namespace = req, namespace
 	return i.build, i.err
 }
@@ -206,6 +209,94 @@ func TestTriggerControllerSyncBuildConfigResource(t *testing.T) {
 	}
 	if inst.namespace != "test2" || !reflect.DeepEqual(inst.req, expected) {
 		t.Errorf("unexpected: %s %s", inst.namespace, diff.ObjectReflectDiff(expected, inst.req))
+	}
+}
+
+func TestTriggerControllerSyncBuildConfigResourceErrorHandling(t *testing.T) {
+	tests := []struct {
+		name    string
+		bc      *buildapi.BuildConfig
+		err     error
+		tagResp []fakeTagResponse
+	}{
+		{
+			name: "NonExistentImageStrem",
+			bc:   scenario_1_buildConfig_imageSource(),
+		},
+		{
+			name:    "DifferentTagUpdate",
+			bc:      scenario_1_buildConfig_imageSource(),
+			tagResp: []fakeTagResponse{{Namespace: "other", Name: "stream2:3", Ref: "image/result:3"}},
+		},
+		{
+			name:    "DifferentImageUpdate",
+			bc:      scenario_1_buildConfig_imageSource(),
+			tagResp: []fakeTagResponse{{Namespace: "other2", Name: "stream:3", Ref: "image/result:4"}},
+		},
+		{
+			name:    "DifferentNamespace",
+			bc:      scenario_1_buildConfig_imageSource(),
+			tagResp: []fakeTagResponse{{Namespace: "foo", Name: "stream:2", Ref: "image/result:1"}},
+		},
+		{
+			name:    "DifferentTriggerType",
+			bc:      scenario_1_buildConfig_otherTrigger(),
+			tagResp: []fakeTagResponse{{Namespace: "foo", Name: "stream:2", Ref: "image/result:1"}},
+		},
+		{
+			name:    "NoImageIDChange",
+			bc:      scenario_1_buildConfig_imageSource_noImageIDChange(),
+			tagResp: []fakeTagResponse{{Namespace: "other", Name: "stream:2", Ref: "image/result:1"}},
+		},
+		{
+			name:    "InstantiationError",
+			bc:      scenario_1_buildConfig_imageSource(),
+			err:     fmt.Errorf("instantiation error"),
+			tagResp: []fakeTagResponse{{Namespace: "other", Name: "stream:2", Ref: "image/result:1"}},
+		},
+	}
+
+	for _, test := range tests {
+		lister := &mockImageStreamLister{
+			stream: scenario_1_imageStream_single("test", "stream", "10"),
+		}
+		store := &cache.FakeCustomStore{
+			GetByKeyFunc: func(key string) (interface{}, bool, error) {
+				return test.bc, true, nil
+			},
+		}
+		inst := &fakeInstantiator{}
+		if test.err != nil {
+			inst.err = test.err
+		}
+		reaction := &buildconfigs.BuildConfigReactor{
+			Instantiator: inst,
+		}
+		controller := TriggerController{
+			triggerCache: NewTriggerCache(),
+			lister:       lister,
+			triggerSources: map[string]TriggerSource{
+				"buildconfigs": {
+					Store:   store,
+					Reactor: reaction,
+				},
+			},
+			tagRetriever: fakeTagRetriever(test.tagResp),
+		}
+
+		err := controller.syncResource("buildconfigs/test/build1")
+		if err == nil && test.err != nil {
+			t.Errorf("Test for %s expected error but got nil", test.name)
+		}
+		if err != nil && test.err == nil {
+			t.Errorf("Test for %s got unexpected error %v", test.name, err)
+		}
+		if err != nil && test.err != nil && !reflect.DeepEqual(err, inst.err) {
+			t.Errorf("Test for %s expected error %v but got %v", test.name, inst.err, err)
+		}
+		if inst.req != nil {
+			t.Errorf("Test for %s generated build unexpectedly", test.name)
+		}
 	}
 }
 
@@ -437,6 +528,27 @@ func scenario_1_deploymentConfig_imageSource_cacheEntry() *trigger.CacheEntry {
 	}
 }
 
+func scenario_1_buildConfig_otherTrigger() *buildapi.BuildConfig {
+	return &buildapi.BuildConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "build2", Namespace: "test2"},
+		Spec: buildapi.BuildConfigSpec{
+			Triggers: []buildapi.BuildTriggerPolicy{
+				{
+					Type:           buildapi.GenericWebHookBuildTriggerType,
+					GenericWebHook: &buildapi.WebHookTrigger{},
+				},
+			},
+			CommonSpec: buildapi.CommonSpec{
+				Strategy: buildapi.BuildStrategy{
+					DockerStrategy: &buildapi.DockerBuildStrategy{
+						From: &kapi.ObjectReference{Kind: "ImageStreamTag", Name: "stream:1"},
+					},
+				},
+			},
+		},
+	}
+}
+
 func scenario_1_buildConfig_imageSource() *buildapi.BuildConfig {
 	return &buildapi.BuildConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "build2", Namespace: "test2"},
@@ -446,6 +558,29 @@ func scenario_1_buildConfig_imageSource() *buildapi.BuildConfig {
 				{ImageChange: &buildapi.ImageChangeTrigger{
 					From:                 &kapi.ObjectReference{Kind: "ImageStreamTag", Name: "stream:2", Namespace: "other"},
 					LastTriggeredImageID: "image/result:2",
+				}},
+				{ImageChange: &buildapi.ImageChangeTrigger{From: &kapi.ObjectReference{Kind: "DockerImage", Name: "mysql", Namespace: "other"}}},
+			},
+			CommonSpec: buildapi.CommonSpec{
+				Strategy: buildapi.BuildStrategy{
+					DockerStrategy: &buildapi.DockerBuildStrategy{
+						From: &kapi.ObjectReference{Kind: "ImageStreamTag", Name: "stream:1"},
+					},
+				},
+			},
+		},
+	}
+}
+
+func scenario_1_buildConfig_imageSource_noImageIDChange() *buildapi.BuildConfig {
+	return &buildapi.BuildConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "build2", Namespace: "test2"},
+		Spec: buildapi.BuildConfigSpec{
+			Triggers: []buildapi.BuildTriggerPolicy{
+				{ImageChange: &buildapi.ImageChangeTrigger{}},
+				{ImageChange: &buildapi.ImageChangeTrigger{
+					From:                 &kapi.ObjectReference{Kind: "ImageStreamTag", Name: "stream:2", Namespace: "other"},
+					LastTriggeredImageID: "image/result:1",
 				}},
 				{ImageChange: &buildapi.ImageChangeTrigger{From: &kapi.ObjectReference{Kind: "DockerImage", Name: "mysql", Namespace: "other"}}},
 			},
